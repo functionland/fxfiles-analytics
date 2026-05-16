@@ -1,9 +1,15 @@
 // fxfiles-analytics — minimal cookieless analytics for AI-generated static
 // sites served from public IPFS gateways. See README.md for the design and
-// API contract. Token-authenticated; no JWT; pure stdlib.
+// API contract.
+//
+// Storage is PostgreSQL (pgx/pgxpool). The previous JSON-on-disk
+// implementation has been retired — see `migrations/001_analytics.sql` for
+// the schema. State that used to live in `tokens.json` and `.salt` now
+// lives in `analytics_cids`, `analytics_visitors`, and `analytics_salt`.
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,12 +22,17 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ---------------------------------------------------------------------------
@@ -30,25 +41,31 @@ import (
 
 type config struct {
 	listenAddr       string
-	dataDir          string
+	pgDSN            string
 	allowedSuffixes  []string
 	rateLimitPerMin  int
-	dailySaltFile    string
 	maxRequestBytes  int64
 	uniqueVisitorTTL time.Duration
 	cleanupInterval  time.Duration
 	maxDistinctCIDs  int
+	// CIDRs of upstream proxies we trust to set X-Forwarded-For / X-Real-IP.
+	// For nginx-on-box the default `127.0.0.1/32, ::1/128` is correct; if
+	// you front the service with a CDN, add its egress range here.
+	trustedProxies []net.IPNet
 }
 
 func loadConfig() (*config, error) {
 	c := &config{
 		listenAddr:       getenv("LISTEN_ADDR", ":8080"),
-		dataDir:          getenv("DATA_DIR", "./data"),
+		pgDSN:            os.Getenv("PG_DSN"),
 		rateLimitPerMin:  atoiOr(getenv("RATE_LIMIT_PER_MIN", "60"), 60),
 		maxRequestBytes:  4 * 1024,
 		uniqueVisitorTTL: 30 * 24 * time.Hour, // keep 30 days of daily sets
 		cleanupInterval:  6 * time.Hour,
 		maxDistinctCIDs:  atoiOr(getenv("MAX_DISTINCT_CIDS", "100000"), 100000),
+	}
+	if c.pgDSN == "" {
+		return nil, errors.New("PG_DSN is required (e.g. postgres://user:pass@127.0.0.1:5433/fxfiles_analytics?sslmode=disable)")
 	}
 	gateways := getenv("ALLOWED_GATEWAYS", ".ipfs.dweb.link,.ipfs.cloud.fx.land")
 	for _, g := range strings.Split(gateways, ",") {
@@ -57,204 +74,247 @@ func loadConfig() (*config, error) {
 			c.allowedSuffixes = append(c.allowedSuffixes, g)
 		}
 	}
-	c.dailySaltFile = getenv("DAILY_SALT_FILE", filepath.Join(c.dataDir, ".salt"))
+	proxiesEnv := getenv("TRUSTED_PROXIES", "127.0.0.1/32,::1/128")
+	for _, p := range strings.Split(proxiesEnv, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		_, ipnet, err := net.ParseCIDR(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid TRUSTED_PROXIES entry %q: %w", p, err)
+		}
+		c.trustedProxies = append(c.trustedProxies, *ipnet)
+	}
 	return c, nil
 }
 
 // ---------------------------------------------------------------------------
-// State: token records + salt rotation, JSON-on-disk persistence
+// State: Postgres-backed counter store + per-day rotating salt
 // ---------------------------------------------------------------------------
 
-// tokenRecord stores per-generation aggregate counts. uniqueVisitors is a
-// map of "YYYY-MM-DD" → set-of-hashed-visitor-ids so we can collapse repeat
-// visits inside one day. Aged-out days are pruned by janitor().
-type tokenRecord struct {
-	Pageviews      int64                          `json:"pageviews"`
-	UniqueVisitors map[string]map[string]struct{} `json:"uniqueVisitors"`
-}
+var errStoreFull = errors.New("store full: distinct CID cap exceeded")
 
-func newTokenRecord() *tokenRecord {
-	return &tokenRecord{UniqueVisitors: map[string]map[string]struct{}{}}
-}
-
-// store is a tiny key-value store wrapping a map[token]*tokenRecord with an
-// RWMutex. Atomic snapshot-and-rewrite persistence.
+// store wraps the connection pool and an in-memory copy of today's salt.
+// The salt is cached because every pageview hashes against it; refetching
+// from the DB on each call would be wasteful and would couple request
+// latency to DB round-trip time.
 type store struct {
+	pool *pgxpool.Pool
+
 	mu       sync.RWMutex
-	records  map[string]*tokenRecord
 	salt     []byte
 	saltDate string
-	dataPath string
-	saltPath string
+
+	// Approximate count of distinct CIDs. Seeded from `SELECT COUNT(*)`
+	// at startup and bumped after every new-CID insert. Used as a fast
+	// pre-check before the per-CID existence query, so the cap check
+	// doesn't have to do a full-table COUNT on every pageview.
+	cidCount atomic.Int64
 }
 
-func newStore(dataDir, saltFile string) (*store, error) {
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return nil, err
+func newStore(ctx context.Context, dsn string) (*store, error) {
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse PG_DSN: %w", err)
 	}
-	s := &store{
-		records:  map[string]*tokenRecord{},
-		dataPath: filepath.Join(dataDir, "tokens.json"),
-		saltPath: saltFile,
+	// Conservative pool sizing — analytics is write-heavy with short txns.
+	poolCfg.MaxConns = 16
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		return nil, fmt.Errorf("pgxpool new: %w", err)
 	}
-	if err := s.loadRecords(); err != nil {
-		return nil, fmt.Errorf("load records: %w", err)
+
+	// Retry the first ping for up to 10s so we tolerate slow Postgres
+	// container starts when systemd brings us up alongside Docker. Kept
+	// short (vs. 30s) so the systemd `StartLimitBurst` actually triggers
+	// within `StartLimitIntervalSec` if the DB is genuinely down — fast
+	// feedback beats a long quiet stall.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err := pool.Ping(ctx)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			pool.Close()
+			return nil, fmt.Errorf("postgres unreachable after 30s: %w", err)
+		}
+		log.Printf("waiting for postgres: %v", err)
+		select {
+		case <-ctx.Done():
+			pool.Close()
+			return nil, ctx.Err()
+		case <-time.After(time.Second):
+		}
 	}
-	if err := s.loadOrRotateSalt(); err != nil {
+
+	s := &store{pool: pool}
+	if err := s.loadOrRotateSalt(ctx); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("load salt: %w", err)
 	}
+
+	var count int64
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM analytics_cids`).Scan(&count); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("seed cid count: %w", err)
+	}
+	s.cidCount.Store(count)
+	log.Printf("store ready: %d distinct CIDs, salt date %s", count, s.saltDate)
 	return s, nil
 }
 
-func (s *store) loadRecords() error {
-	b, err := os.ReadFile(s.dataPath)
-	if errors.Is(err, os.ErrNotExist) {
+func (s *store) close() {
+	s.pool.Close()
+}
+
+// loadOrRotateSalt reads today's salt from the DB, generating it if no
+// row exists for today. Concurrent processes calling this at exactly
+// midnight UTC are safe — `ON CONFLICT DO NOTHING` + re-read picks up
+// whichever one won the race.
+func (s *store) loadOrRotateSalt(ctx context.Context) error {
+	today := time.Now().UTC().Format("2006-01-02")
+	var salt []byte
+	err := s.pool.QueryRow(ctx, `SELECT salt FROM analytics_salt WHERE day = $1`, today).Scan(&salt)
+	if err == nil {
+		s.mu.Lock()
+		s.salt = salt
+		s.saltDate = today
+		s.mu.Unlock()
 		return nil
 	}
-	if err != nil {
+	if !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
-	persisted := map[string]*tokenRecord{}
-	if err := json.Unmarshal(b, &persisted); err != nil {
-		return err
-	}
-	// Hydrate missing unique-visitor maps from older snapshots.
-	for _, rec := range persisted {
-		if rec.UniqueVisitors == nil {
-			rec.UniqueVisitors = map[string]map[string]struct{}{}
-		}
-	}
-	s.records = persisted
-	return nil
+	return s.rotateSalt(ctx, today)
 }
 
-func (s *store) persist() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	b, err := json.Marshal(s.records)
-	if err != nil {
-		return err
-	}
-	tmp := s.dataPath + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.dataPath)
-}
-
-func (s *store) stats(key string) (pageviews, unique int64, ok bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	rec, exists := s.records[key]
-	if !exists {
-		return 0, 0, false
-	}
-	var u int64
-	for _, day := range rec.UniqueVisitors {
-		u += int64(len(day))
-	}
-	return rec.Pageviews, u, true
-}
-
-// recordPageview lazily creates a record for [key] (the IPFS CID) on first
-// sight, then increments its pageview counter and adds [visitorHash] to the
-// per-day unique-visitor set. Returns [errStoreFull] when the per-instance
-// CID cap is exceeded and the CID is new, so callers can return 503/429
-// instead of silently dropping. Existing records are always updated.
-func (s *store) recordPageview(key, visitorHash, day string, capCIDs int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, exists := s.records[key]
-	if !exists {
-		if capCIDs > 0 && len(s.records) >= capCIDs {
-			return errStoreFull
-		}
-		rec = newTokenRecord()
-		s.records[key] = rec
-	}
-	rec.Pageviews++
-	bucket, ok := rec.UniqueVisitors[day]
-	if !ok {
-		bucket = map[string]struct{}{}
-		rec.UniqueVisitors[day] = bucket
-	}
-	bucket[visitorHash] = struct{}{}
-	return nil
-}
-
-// loadOrRotateSalt loads today's salt from disk or rotates it if the file is
-// stale. The salt is reseeded at UTC midnight by the janitor goroutine.
-func (s *store) loadOrRotateSalt() error {
-	today := time.Now().UTC().Format("2006-01-02")
-	b, err := os.ReadFile(s.saltPath)
-	if err == nil {
-		// File format: "YYYY-MM-DD\n<hex>"
-		lines := strings.SplitN(strings.TrimSpace(string(b)), "\n", 2)
-		if len(lines) == 2 && lines[0] == today {
-			raw, derr := hex.DecodeString(lines[1])
-			if derr == nil && len(raw) >= 16 {
-				s.salt = raw
-				s.saltDate = today
-				return nil
-			}
-		}
-	}
-	return s.rotateSalt(today)
-}
-
-func (s *store) rotateSalt(day string) error {
+func (s *store) rotateSalt(ctx context.Context, day string) error {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return err
 	}
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO analytics_salt(day, salt) VALUES ($1, $2) ON CONFLICT (day) DO NOTHING`,
+		day, buf); err != nil {
+		return err
+	}
+	// Re-read so concurrent processes converge on the same canonical salt
+	// (whichever insert won the ON CONFLICT race).
+	var canonical []byte
+	if err := s.pool.QueryRow(ctx,
+		`SELECT salt FROM analytics_salt WHERE day = $1`, day).Scan(&canonical); err != nil {
+		return err
+	}
 	s.mu.Lock()
-	s.salt = buf
+	s.salt = canonical
 	s.saltDate = day
 	s.mu.Unlock()
-	body := fmt.Sprintf("%s\n%s\n", day, hex.EncodeToString(buf))
-	tmp := s.saltPath + ".tmp"
-	if err := os.MkdirAll(filepath.Dir(s.saltPath), 0o755); err != nil {
-		return err
-	}
-	if err := os.WriteFile(tmp, []byte(body), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.saltPath)
+	return nil
 }
 
-// visitorHash returns sha256(salt || ip || ua) truncated to 16 hex chars.
-// Truncation is intentional — uniqueness within a single day is enough.
-func (s *store) visitorHash(ip, ua string) (string, string) {
+func (s *store) stats(ctx context.Context, cid string) (pv, uv int64, ok bool, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT pageviews FROM analytics_cids WHERE cid = $1`, cid).Scan(&pv)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, 0, false, nil
+	}
+	if err != nil {
+		return 0, 0, false, err
+	}
+	err = s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM analytics_visitors WHERE cid = $1`, cid).Scan(&uv)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return pv, uv, true, nil
+}
+
+// recordPageview increments the counter for `cid` and adds `visitorHash`
+// to the per-day unique-visitor set. Returns `errStoreFull` when the
+// per-instance CID cap is exceeded and the CID is new, so callers can
+// return 503/429 instead of silently dropping. Existing records are
+// always updated regardless of the cap.
+func (s *store) recordPageview(ctx context.Context, cid, visitorHash, day string, capCIDs int) error {
+	// Cheap pre-check: if our cached count is already at/above cap, do
+	// the existence query first to decide whether to short-circuit.
+	if capCIDs > 0 && s.cidCount.Load() >= int64(capCIDs) {
+		var exists bool
+		if err := s.pool.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM analytics_cids WHERE cid = $1)`, cid).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return errStoreFull
+		}
+	}
+
+	// Upsert. `xmax = 0` discriminates a fresh insert from an
+	// ON-CONFLICT update so we can bump the cached CID count.
+	var inserted bool
+	if err := s.pool.QueryRow(ctx, `
+		INSERT INTO analytics_cids(cid, pageviews) VALUES ($1, 1)
+		ON CONFLICT (cid) DO UPDATE
+		   SET pageviews = analytics_cids.pageviews + 1,
+		       updated_at = NOW()
+		RETURNING (xmax = 0) AS inserted
+	`, cid).Scan(&inserted); err != nil {
+		return err
+	}
+	if inserted {
+		s.cidCount.Add(1)
+	}
+
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO analytics_visitors(cid, day, visitor_hash) VALUES ($1, $2, $3)
+		ON CONFLICT DO NOTHING
+	`, cid, day, visitorHash); err != nil {
+		return err
+	}
+	return nil
+}
+
+// visitorHash returns sha256(salt || ip || ua) truncated to 16 hex chars
+// alongside the salt date the hash is keyed against. Truncation is
+// intentional — uniqueness within a single day is enough.
+func (s *store) visitorHash(ip, ua string) (hash, day string) {
 	s.mu.RLock()
 	salt := s.salt
-	day := s.saltDate
+	d := s.saltDate
 	s.mu.RUnlock()
 	h := sha256.New()
 	h.Write(salt)
 	h.Write([]byte(ip))
 	h.Write([]byte{0})
 	h.Write([]byte(ua))
-	return hex.EncodeToString(h.Sum(nil)[:8]), day
+	return hex.EncodeToString(h.Sum(nil)[:8]), d
 }
 
-// pruneOldDays drops day-keys older than ttl from every record.
-func (s *store) pruneOldDays(ttl time.Duration) {
+// pruneOldDays drops visitor rows older than `ttl` and old salt rows.
+// Idempotent; safe to call on a schedule.
+func (s *store) pruneOldDays(ctx context.Context, ttl time.Duration) error {
 	cutoff := time.Now().UTC().Add(-ttl).Format("2006-01-02")
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, rec := range s.records {
-		for day := range rec.UniqueVisitors {
-			if day < cutoff {
-				delete(rec.UniqueVisitors, day)
-			}
-		}
+	if _, err := s.pool.Exec(ctx,
+		`DELETE FROM analytics_visitors WHERE day < $1`, cutoff); err != nil {
+		return err
 	}
+	// Keep one extra week of salts for forensic ability to verify older
+	// hashes if needed.
+	saltCutoff := time.Now().UTC().Add(-ttl - 7*24*time.Hour).Format("2006-01-02")
+	if _, err := s.pool.Exec(ctx,
+		`DELETE FROM analytics_salt WHERE day < $1`, saltCutoff); err != nil {
+		return err
+	}
+	return nil
 }
-
-var errStoreFull = errors.New("store full: distinct CID cap exceeded")
 
 // ---------------------------------------------------------------------------
-// Rate limiting: per (token, ip) sliding 1-minute window
+// Rate limiting: per (cid, ip) sliding 1-minute window — in-memory.
 // ---------------------------------------------------------------------------
 
 type rateLimiter struct {
@@ -273,7 +333,6 @@ func (r *rateLimiter) allow(token, ip string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	hits := r.buckets[key]
-	// Drop hits older than 60s.
 	i := 0
 	for i < len(hits) && hits[i].Before(cutoff) {
 		i++
@@ -310,12 +369,7 @@ func (r *rateLimiter) prune() {
 // ---------------------------------------------------------------------------
 
 var (
-	// CID shape: base58 v0 (`Qm...`) or base32 v1 (`bafy...`/`bafk...`/
-	// `bafz...`/`bafyb...`). Lenient on length because IPFS CIDs vary by
-	// hash + codec; tighten if you only generate one shape.
 	cidPattern = regexp.MustCompile(`^(Qm[1-9A-HJ-NP-Za-km-z]{44}|baf[ykz][a-z0-9]{40,80})$`)
-	// Crude bot detector: drop common headless / scraper UA tokens. This is
-	// intentionally minimal — see README for the privacy trade-off.
 	botPattern = regexp.MustCompile(`(?i)bot|crawler|spider|scrap|wget|curl|http-client|headless|preview`)
 )
 
@@ -329,10 +383,7 @@ func (s *server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/track", s.handleTrack)
 	mux.HandleFunc("GET /api/v1/stats/{cid}", s.handleStats)
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "ok")
-	})
+	mux.HandleFunc("GET /healthz", s.handleHealth)
 	return mux
 }
 
@@ -343,8 +394,6 @@ type trackPayload struct {
 }
 
 func (s *server) handleTrack(w http.ResponseWriter, r *http.Request) {
-	// Always read the body up to a small cap so an oversized request can't
-	// stall us.
 	body := http.MaxBytesReader(w, r.Body, s.cfg.maxRequestBytes)
 	defer body.Close()
 	var p trackPayload
@@ -356,28 +405,29 @@ func (s *server) handleTrack(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-
-	// Origin / Referer must match an allowed gateway suffix when present.
 	if !s.originAllowed(r) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
-
 	ua := r.Header.Get("User-Agent")
 	if ua == "" || botPattern.MatchString(ua) {
-		// Silently drop — bots inflate counts otherwise.
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-
-	ip := clientIP(r)
+	ip := s.clientIP(r)
 	if !s.limiter.allow(p.CID, ip) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		return
 	}
 
-	visitorHash, day := s.store.visitorHash(ip, ua)
-	if err := s.store.recordPageview(p.CID, visitorHash, day, s.cfg.maxDistinctCIDs); err != nil {
+	hash, day := s.store.visitorHash(ip, ua)
+
+	// Per-request DB timeout so a slow/stuck Postgres doesn't pile up
+	// goroutines under load.
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := s.store.recordPageview(ctx, p.CID, hash, day, s.cfg.maxDistinctCIDs); err != nil {
 		if errors.Is(err, errStoreFull) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -386,12 +436,6 @@ func (s *server) handleTrack(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	// Best-effort persistence; failure to flush isn't fatal for one event.
-	go func() {
-		if err := s.store.persist(); err != nil {
-			log.Printf("persist error: %v", err)
-		}
-	}()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -401,33 +445,49 @@ func (s *server) handleStats(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	pv, uv, ok := s.store.stats(cid)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	pv, uv, ok, err := s.store.stats(ctx, cid)
+	if err != nil {
+		log.Printf("stats error: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	if !ok {
-		// Unknown CID = no pings yet. Surface zeroes so the app shows "0
-		// views · 0 visitors" rather than "Analytics unavailable".
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
+		// Surface zeroes so the app shows "0 views · 0 visitors" rather
+		// than "Analytics unavailable" for sites that haven't been
+		// visited yet.
 		_ = json.NewEncoder(w).Encode(map[string]int64{
 			"pageviews":      0,
 			"uniqueVisitors": 0,
 		})
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(map[string]int64{
 		"pageviews":      pv,
 		"uniqueVisitors": uv,
 	})
 }
 
+func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.store.pool.Ping(ctx); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, "db unavailable")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, "ok")
+}
+
 func (s *server) originAllowed(r *http.Request) bool {
 	if len(s.cfg.allowedSuffixes) == 0 {
 		return true
 	}
-	// Pick the first present header; allow either to satisfy. If neither is
-	// present (e.g. a same-origin or no-referrer request), accept — we can't
-	// distinguish a legit no-referrer ping from a forged one without it.
 	candidates := []string{r.Header.Get("Origin"), r.Header.Get("Referer")}
 	any := false
 	for _, raw := range candidates {
@@ -448,17 +508,43 @@ func (s *server) originAllowed(r *http.Request) bool {
 	return !any
 }
 
-func clientIP(r *http.Request) string {
-	// Trust X-Forwarded-For only if the connection comes through a known
-	// proxy; for simplicity here we take the first hop. In a real deploy
-	// strip this to your trusted-proxy list.
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.SplitN(xff, ",", 2)
-		return strings.TrimSpace(parts[0])
-	}
+// clientIP returns the originating client IP, honouring X-Forwarded-For
+// ONLY when the immediate peer (r.RemoteAddr) is in the trusted-proxies
+// CIDR list. This is the production-safe pattern: without it, any
+// attacker can spoof their rate-limit identity by setting XFF themselves.
+func (s *server) clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	remoteIP := net.ParseIP(host)
+	if remoteIP == nil {
+		return host
+	}
+	trusted := false
+	for _, cidr := range s.cfg.trustedProxies {
+		if cidr.Contains(remoteIP) {
+			trusted = true
+			break
+		}
+	}
+	if !trusted {
+		return host
+	}
+	// Trusted peer — accept their XFF / X-Real-IP. We take the first
+	// (leftmost) entry, which by convention is the original client IP
+	// closest to the user. nginx (as configured by our installer) only
+	// emits one value here.
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		for _, p := range strings.Split(xff, ",") {
+			ip := strings.TrimSpace(p)
+			if ip != "" {
+				return ip
+			}
+		}
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
 	}
 	return host
 }
@@ -472,44 +558,55 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
-	st, err := newStore(cfg.dataDir, cfg.dailySaltFile)
+
+	rootCtx, cancelRoot := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM)
+	defer cancelRoot()
+
+	st, err := newStore(rootCtx, cfg.pgDSN)
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
+	defer st.close()
+
 	srv := &server{
 		cfg:     cfg,
 		store:   st,
 		limiter: newRateLimiter(cfg.rateLimitPerMin),
 	}
 
-	// Janitor: rotate daily salt at UTC midnight, prune old visitor sets, and
-	// trim the rate-limiter map every cleanupInterval.
+	// Janitor: rotate daily salt at UTC midnight, prune old visitor rows,
+	// and trim the in-memory rate-limiter map every cleanupInterval.
 	go func() {
 		t := time.NewTicker(time.Minute)
 		defer t.Stop()
 		lastDay := st.saltDate
 		lastPrune := time.Now()
-		for now := range t.C {
-			today := now.UTC().Format("2006-01-02")
-			if today != lastDay {
-				if err := st.rotateSalt(today); err != nil {
-					log.Printf("rotate salt: %v", err)
-				} else {
-					lastDay = today
+		for {
+			select {
+			case <-rootCtx.Done():
+				return
+			case now := <-t.C:
+				today := now.UTC().Format("2006-01-02")
+				if today != lastDay {
+					if err := st.rotateSalt(rootCtx, today); err != nil {
+						log.Printf("rotate salt: %v", err)
+					} else {
+						lastDay = today
+					}
 				}
-			}
-			if now.Sub(lastPrune) >= cfg.cleanupInterval {
-				st.pruneOldDays(cfg.uniqueVisitorTTL)
-				srv.limiter.prune()
-				if err := st.persist(); err != nil {
-					log.Printf("janitor persist: %v", err)
+				if now.Sub(lastPrune) >= cfg.cleanupInterval {
+					if err := st.pruneOldDays(rootCtx, cfg.uniqueVisitorTTL); err != nil {
+						log.Printf("prune: %v", err)
+					}
+					srv.limiter.prune()
+					lastPrune = now
 				}
-				lastPrune = now
 			}
 		}
 	}()
 
-	server := &http.Server{
+	httpSrv := &http.Server{
 		Addr:              cfg.listenAddr,
 		Handler:           srv.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -517,10 +614,24 @@ func main() {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,
 	}
+
+	// Graceful shutdown: stop accepting new connections, wait up to 10s
+	// for in-flight to finish.
+	go func() {
+		<-rootCtx.Done()
+		log.Printf("shutdown signal received")
+		shCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(shCtx); err != nil {
+			log.Printf("graceful shutdown: %v", err)
+		}
+	}()
+
 	log.Printf("fxfiles-analytics listening on %s", cfg.listenAddr)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+	log.Printf("server stopped cleanly")
 }
 
 // ---------------------------------------------------------------------------

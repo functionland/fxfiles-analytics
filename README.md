@@ -118,9 +118,29 @@ The CID is public — it's the URL. Anyone can:
 
 The CID is the only identifier the service uses; there is no other secret to leak.
 
-## Build & run
+## Storage
+
+Single-binary Go service backed by **PostgreSQL** (driver: `github.com/jackc/pgx/v5`). Schema lives in `migrations/001_analytics.sql`:
+
+- `analytics_cids(cid TEXT PRIMARY KEY, pageviews BIGINT, …)` — one row per IPFS CID, with a monotonically-increasing counter.
+- `analytics_visitors(cid, day, visitor_hash, PRIMARY KEY(cid,day,visitor_hash))` — natural compound PK dedupes repeat visits within a day.
+- `analytics_salt(day DATE PRIMARY KEY, salt BYTEA)` — daily-rotating salt. Storing it in the DB (not a `.salt` file) means backups capture it alongside the data — without the salt, today's visitor uniqueness continuity is lost.
+
+A previous version of this service used a JSON file on disk; that path is retired. Migration of existing data is not supported (counters are recreatable from new traffic; the absence of yesterday's visitor hashes is harmless because they would have aged out anyway).
+
+## Build & run (development)
 
 ```bash
+# Spin up a local Postgres for development:
+docker run -d --name pg-dev -p 127.0.0.1:5432:5432 \
+  -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=fxfiles_analytics \
+  postgres:16-alpine
+
+# Apply the schema:
+docker exec -i pg-dev psql -U postgres -d fxfiles_analytics < migrations/001_analytics.sql
+
+# Run:
+export PG_DSN='postgres://postgres:devpass@127.0.0.1:5432/fxfiles_analytics?sslmode=disable'
 go run ./...
 ```
 
@@ -129,19 +149,36 @@ Environment variables:
 | Var | Default | Notes |
 |---|---|---|
 | `LISTEN_ADDR` | `:8080` | Bind address. |
-| `DATA_DIR` | `./data` | JSON state file lives here. |
+| `PG_DSN` | _(required)_ | PostgreSQL DSN (libpq-style). |
 | `ALLOWED_GATEWAYS` | `.ipfs.dweb.link,.ipfs.cloud.fx.land` | Comma-separated `Referer`/`Origin` suffixes that `/track` accepts. |
 | `RATE_LIMIT_PER_MIN` | `60` | Per-IP-per-CID cap. |
 | `MAX_DISTINCT_CIDS` | `100000` | Hard cap on distinct CIDs in the store. New pings beyond the cap return `503`. |
-| `DAILY_SALT_FILE` | `$DATA_DIR/.salt` | Where the rotating salt is persisted. Rotates at midnight UTC. |
+| `TRUSTED_PROXIES` | `127.0.0.1/32,::1/128` | CIDRs whose `X-Forwarded-For` / `X-Real-IP` we trust for the rate-limiter. Anything else is treated as the literal peer. |
+
+## Production deploy
+
+Use `./install.sh` on the target Ubuntu/Debian server. It will:
+
+- Pre-flight checks (OS, disk, systemd, Docker).
+- Install missing apt packages (`nginx`, `certbot`, `ufw`, `postgresql-client`, `golang-go`, …).
+- Prompt for domain, Let's Encrypt email, listen address, allowed gateways.
+- Create a dedicated PostgreSQL container `postgres-analytics` bound to `127.0.0.1:5433` (separate from the pinning-service's `postgres-pinning` for isolation; ~100 MB RAM overhead is worth shielding the revenue path from analytics burst writes).
+- Provision a least-privilege role: a NOLOGIN owner role holds DDL, the runtime LOGIN role only gets DML.
+- Audit firewall state; prompt to enable UFW with `allow 22/80/443, default deny`; add `deny 5432/5433` defense-in-depth rules.
+- Build the Go binary to `/opt/fxfiles-analytics/bin/`.
+- Install a heavily-sandboxed systemd unit (`NoNewPrivileges`, `ProtectSystem=strict`, `MemoryDenyWriteExecute`, capped restarts, `MemoryMax=256M`, etc.).
+- Configure nginx with an authoritative `X-Forwarded-For` rewrite, then run certbot for HTTPS.
+- Smoke-test `/healthz` over HTTP and HTTPS.
+
+Re-run `./install.sh` to update — it auto-detects `/etc/fxfiles-analytics/fxfiles-analytics.env`, backs it up, preserves credentials, rebuilds the binary only if source changed, and never re-provisions the Postgres container.
 
 ```bash
 docker build -t fxfiles-analytics .
-docker run -p 8080:8080 \
-  -v $PWD/data:/app/data \
+docker run --rm -p 8080:8080 \
+  -e PG_DSN='postgres://...' \
   fxfiles-analytics
 ```
 
 ## Status
 
-This is a **reference implementation** — minimal, single-binary, JSON-on-disk storage. Production deploys should replace the storage layer with PostgreSQL or Redis, add structured logging, and front it with a reverse proxy that terminates TLS and handles request-body limits.
+Production-ready. Single binary, structured logs via journald in deploy, PostgreSQL storage, fronted by nginx with TLS via Let's Encrypt.

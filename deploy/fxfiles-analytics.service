@@ -1,0 +1,83 @@
+[Unit]
+Description=FxFiles Analytics (IPFS pageview tracker)
+Documentation=https://github.com/functionland/fxfiles-analytics
+# Postgres lives in Docker; wait for the network and the docker daemon to
+# be ready before we try to dial it. The Go service additionally retries
+# the first connection for 30s, so a slow Docker start won't crash-loop.
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+# Note: `Wants` (not `Requires`) so that restarting/upgrading docker
+# doesn't drag this service down with it. The `After=` ordering is what
+# actually matters at boot.
+
+[Service]
+Type=simple
+User=fxfiles-analytics
+Group=fxfiles-analytics
+WorkingDirectory=/var/lib/fxfiles-analytics
+EnvironmentFile=/etc/fxfiles-analytics/fxfiles-analytics.env
+ExecStart=/opt/fxfiles-analytics/bin/fxfiles-analytics
+
+# Restart policy: bounded crash loop. The binary's in-process DB-retry
+# budget is ~10 seconds, plus RestartSec=5 — so each failed attempt
+# costs ~15 s. With burst=5/interval=120 we get five attempts spread
+# across two minutes before systemd gives up. If the DB really isn't
+# coming back in 2 min, paging a human is more useful than burning CPU.
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+# Resource caps. Analytics is tiny — 256 MB is generous, 80% of one CPU
+# stops a runaway loop from eating the whole VPS.
+MemoryMax=256M
+CPUQuota=80%
+TasksMax=64
+
+# ----------------------------------------------------------------------
+# Sandboxing — defense in depth. Order roughly mirrors `systemd-analyze
+# security`. If you tighten anything beyond this, test on a staging box
+# first because some of these can silently break dlopen / cgo / DNS.
+# ----------------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateMounts=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+LockPersonality=true
+# Go binaries don't need W+X memory pages (no JIT/cgo plugins here).
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+# Writable state: /var/lib/fxfiles-analytics (StateDirectory) — managed
+# by systemd, owned by the service user.
+StateDirectory=fxfiles-analytics
+StateDirectoryMode=0750
+LogsDirectory=fxfiles-analytics
+LogsDirectoryMode=0750
+ReadWritePaths=/var/lib/fxfiles-analytics /var/log/fxfiles-analytics
+
+# Drop all capabilities — we're a plain HTTP server, we don't bind to
+# privileged ports or do anything that needs them.
+AmbientCapabilities=
+CapabilityBoundingSet=
+
+# stdout/stderr go to journald — `journalctl -u fxfiles-analytics`.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

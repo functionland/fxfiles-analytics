@@ -1,0 +1,83 @@
+# /etc/nginx/sites-available/fxfiles-analytics
+# Template — install.sh substitutes __DOMAIN__ and __UPSTREAM__.
+#
+# This template is HTTP-only on purpose: `certbot --nginx -d $DOMAIN
+# --redirect` (run by install.sh after this is loaded) detects the
+# server block, generates the cert, adds the `listen 443 ssl` block
+# with the cert paths, and replaces this HTTP block with a redirect.
+# If we shipped a `listen 443 ssl` block here pointing at certs that
+# don't exist yet, `nginx -t` would fail on first install.
+
+# Track-endpoint payloads are tiny (~200 bytes); cap aggressively so a
+# stuck-client can't tie up worker connections.
+limit_req_zone $binary_remote_addr zone=fxfiles_analytics_track:10m rate=120r/m;
+
+upstream fxfiles_analytics_upstream {
+    server __UPSTREAM__;
+    keepalive 16;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __DOMAIN__;
+
+    # certbot's webroot challenge — must stay reachable over HTTP even
+    # after the HTTPS block is added.
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    # Small request bodies only — the /track JSON is ~200 bytes and Go
+    # caps at 4 KB internally.
+    client_max_body_size 8k;
+    client_body_timeout 5s;
+    client_header_timeout 5s;
+    keepalive_timeout 30s;
+
+    # Strict security headers — analytics has no UI, so these cost
+    # nothing and block accidental embedding.
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    # HSTS lives here too once certbot rewrites this block to HTTPS;
+    # certbot's --redirect path preserves these headers.
+
+    location /api/v1/track {
+        limit_req zone=fxfiles_analytics_track burst=60 nodelay;
+        limit_req_status 429;
+        proxy_pass http://fxfiles_analytics_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        # Authoritative IP — overwrite (NOT pass through) any client-set
+        # XFF so the Go rate-limiter can't be tricked.
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 10s;
+        proxy_send_timeout 10s;
+    }
+
+    location /api/v1/stats/ {
+        proxy_pass http://fxfiles_analytics_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 10s;
+        proxy_send_timeout 10s;
+    }
+
+    location = /healthz {
+        proxy_pass http://fxfiles_analytics_upstream;
+        access_log off;
+    }
+
+    # Everything else: 404 (no UI surface, no robots.txt, no favicon).
+    location / {
+        return 404;
+    }
+}
