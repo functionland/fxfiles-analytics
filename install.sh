@@ -750,16 +750,14 @@ main() {
     write_config_file
     install_systemd_unit
 
-    # Only configure nginx + TLS on fresh install or when the unit changed.
-    # nginx -t catches config drift, certbot's timer handles renewal.
-    if [[ "$IS_UPDATE" != true || ! -f "$NGINX_AVAILABLE" ]]; then
-        install_nginx_site
-        issue_or_renew_cert
-    else
-        # Re-templating the nginx file is safe and picks up any
-        # template changes we shipped.
-        install_nginx_site
-    fi
+    # Always re-render the nginx site (picks up template changes we
+    # ship) and always call issue_or_renew_cert — the function itself
+    # short-circuits when /etc/letsencrypt/live/$DOMAIN exists, so this
+    # is also the recovery path when the first cert attempt failed
+    # (e.g. DNS pointing at Cloudflare orange-cloud) and the operator
+    # has since fixed it.
+    install_nginx_site
+    issue_or_renew_cert
 
     start_or_restart_service
     smoke_test
