@@ -272,9 +272,8 @@ ensure_postgres() {
     print_step "PostgreSQL container"
 
     if docker inspect "$PG_CONTAINER" >/dev/null 2>&1; then
-        print_info "Container ${PG_CONTAINER} already exists — verifying binding."
-        audit_pg_binding
-        # Just make sure it's running.
+        print_info "Container ${PG_CONTAINER} already exists."
+        # Just make sure it's running. Binding audit already ran in main().
         if ! docker ps --format '{{.Names}}' | grep -q "^${PG_CONTAINER}\$"; then
             print_info "Starting stopped container ${PG_CONTAINER}..."
             docker start "$PG_CONTAINER" >/dev/null
@@ -425,30 +424,64 @@ audit_pg_binding() {
 setup_firewall() {
     print_step "Firewall (UFW)"
 
+    # If the operator plans to also run the FxFiles pinning-service on
+    # this host, we pre-allow the IPFS swarm + cluster comms ports here.
+    # The pinning-service's own installer adds DENY rules for the API
+    # ports (5001, 9094, 9095) but does NOT add ALLOW rules for libp2p
+    # (4001) or cluster comms (9096) — those need to reach the internet
+    # for IPFS to peer at all. Asking up-front avoids a "why isn't my
+    # IPFS connecting?" debugging session later.
+    local pin_coexist=false
+    if [[ "$IS_UPDATE" != true ]]; then
+        local reply
+        read -r -p "Will you also install pinning-service on this host? [y/N]: " reply || true
+        [[ "$reply" =~ ^[Yy]$ ]] && pin_coexist=true
+    fi
+
     if ! ufw status 2>/dev/null | grep -q "^Status: active"; then
-        print_warn "UFW is INACTIVE. Recommended: allow 22 (ssh), 80 (http), 443 (https); deny everything else."
-        if confirm "Enable UFW with this policy now?"; then
-            ufw --force reset >/dev/null
+        print_warn "UFW is INACTIVE."
+        if confirm "Enable UFW now with allow 22/80/443 + default-deny incoming?"; then
+            # Deliberately NOT `ufw --force reset` — that wipes any
+            # rules the operator already added (custom SSH port, VPN
+            # subnet, etc.) and is the fast path to locking yourself
+            # out. We just apply policy on top.
             ufw default deny incoming >/dev/null
             ufw default allow outgoing >/dev/null
             ufw allow 22/tcp comment 'ssh' >/dev/null
             ufw allow 80/tcp comment 'http' >/dev/null
             ufw allow 443/tcp comment 'https' >/dev/null
             ufw --force enable >/dev/null
-            print_success "UFW enabled (deny incoming except 22/80/443)."
+            print_success "UFW enabled."
         else
             print_warn "Skipping UFW setup — recommend revisiting before exposing the service."
+            return
         fi
     else
-        # Make sure 80/443 are allowed (nginx needs them).
+        # Already active: just make sure the bare-minimum ports we need
+        # are allowed. Don't touch the rest of the rule set.
         ufw allow 80/tcp >/dev/null 2>&1 || true
         ufw allow 443/tcp >/dev/null 2>&1 || true
     fi
 
-    # Defense in depth: deny the Postgres port even though Docker
-    # bypasses UFW. The 127.0.0.1 bind above is the real protection;
+    # Pre-allow ports the pinning-service will need so its installer
+    # (which doesn't add these itself) runs cleanly later. These ports
+    # are harmless if pinning never gets installed — without a service
+    # bound to them the kernel rejects connections anyway; UFW allow
+    # just makes the eventual install seamless.
+    if [[ "$pin_coexist" = true ]]; then
+        ufw allow 4001/tcp comment 'ipfs libp2p swarm' >/dev/null 2>&1 || true
+        ufw allow 4001/udp comment 'ipfs libp2p swarm (quic)' >/dev/null 2>&1 || true
+        ufw allow 9096/tcp comment 'ipfs-cluster peer comms' >/dev/null 2>&1 || true
+        print_success "Pre-allowed IPFS ports (4001/tcp, 4001/udp, 9096/tcp) for future pinning-service install."
+    fi
+
+    # Defense in depth: deny the Postgres ports even though Docker's
+    # iptables rules bypass UFW. The 127.0.0.1 bind set up by both this
+    # installer and (later) pinning-service is the real protection;
     # these rules block native processes if anyone later starts a host
     # Postgres on the same port.
+    #   5432 → pinning-service's postgres-pinning (when it lands later).
+    #   $PG_HOST_PORT (default 5433) → our postgres-analytics.
     if ufw status 2>/dev/null | grep -q "^Status: active"; then
         local port
         for port in 5432 "$PG_HOST_PORT"; do
@@ -690,11 +723,22 @@ main() {
     ensure_service_user
     ensure_dirs
 
+    # Make sure dockerd is actually running. `ensure_packages` enables it
+    # on first install, but if Docker was already installed (manually,
+    # or from a prior install attempt) the daemon might be stopped — in
+    # which case `docker ps` would return empty and silently fool the
+    # audit below into thinking no Postgres containers exist.
+    systemctl is-active --quiet docker || systemctl start docker
+
+    # Audit BEFORE anything else Postgres-related runs. Catches a
+    # pre-existing postgres-pinning (or anything else) that someone
+    # bootstrapped on 0.0.0.0:5432 — refuse the install rather than
+    # build the rest of the stack on top of an internet-exposed DB.
+    audit_pg_binding
+
     # Postgres + migrations only on fresh install — never re-provision a
-    # running container's roles/db, that would clobber credentials. The
-    # binding audit still runs every time as a sanity check.
+    # running container's roles/db, that would clobber credentials.
     if [[ "$IS_UPDATE" = true ]]; then
-        audit_pg_binding
         apply_migrations
     else
         ensure_postgres

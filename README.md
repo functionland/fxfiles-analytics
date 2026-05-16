@@ -172,6 +172,23 @@ Use `./install.sh` on the target Ubuntu/Debian server. It will:
 
 Re-run `./install.sh` to update — it auto-detects `/etc/fxfiles-analytics/fxfiles-analytics.env`, backs it up, preserves credentials, rebuilds the binary only if source changed, and never re-provisions the Postgres container.
 
+### Coexistence with `pinning-service`
+
+This installer is designed to be the **first** thing you run on a fresh server. The FxFiles `pinning-service` installer can then run later without conflicts:
+
+- Different Postgres containers: this one creates `postgres-analytics` on `127.0.0.1:5433`; pinning uses `postgres-pinning` on `127.0.0.1:5432` (which the operator bootstraps separately — pinning's `install.sh` audits the binding but doesn't create the container).
+- UFW is enabled (if you opt in) **without** wiping existing rules. If you answer **Y** to the "Will you also install pinning-service on this host?" prompt, `4001/tcp`, `4001/udp`, and `9096/tcp` are pre-allowed so IPFS libp2p + cluster comms work the moment pinning is installed. Pinning's installer adds DENY rules for its localhost-only ports (5001, 9094, 9095) but doesn't add ALLOW rules for the public IPFS ports, so this prompt fills the gap.
+- Different service users, install dirs, nginx sites, and certbot certs.
+- The binding audit runs on **every** install/update and refuses to proceed if any Postgres container is published on `0.0.0.0`. If you bootstrap `postgres-pinning` later, bind it to `127.0.0.1:5432` from the start.
+
+**If you said "No" to the pinning prompt at first and changed your mind later**, the IPFS allow rules won't be retro-added (re-running the installer is in update mode and doesn't re-prompt). Add them by hand before running `pinning-service/install.sh`:
+
+```bash
+sudo ufw allow 4001/tcp comment 'ipfs libp2p swarm'
+sudo ufw allow 4001/udp comment 'ipfs libp2p swarm (quic)'
+sudo ufw allow 9096/tcp comment 'ipfs-cluster peer comms'
+```
+
 ```bash
 docker build -t fxfiles-analytics .
 docker run --rm -p 8080:8080 \
